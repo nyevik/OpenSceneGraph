@@ -380,14 +380,24 @@ Registry::Registry()
     // really need to decide this at runtime...
     #if defined(USE_FFMPEG)
 
+        addFileExtensionAlias("mp4",  "ffmpeg");
+        addFileExtensionAlias("m4v",  "ffmpeg");
         addFileExtensionAlias("mov",  "ffmpeg");
         addFileExtensionAlias("mpg",  "ffmpeg");
+        addFileExtensionAlias("mpeg", "ffmpeg");
+        addFileExtensionAlias("ogg",  "ffmpeg");
         addFileExtensionAlias("ogv",  "ffmpeg");
         addFileExtensionAlias("mpv",  "ffmpeg");
         addFileExtensionAlias("dv",   "ffmpeg");
         addFileExtensionAlias("avi",  "ffmpeg");
         addFileExtensionAlias("wmv",  "ffmpeg");
         addFileExtensionAlias("flv",  "ffmpeg");
+        addFileExtensionAlias("mkv",  "ffmpeg");
+        addFileExtensionAlias("mjpeg","ffmpeg");
+        addFileExtensionAlias("3gp",  "ffmpeg");
+        addFileExtensionAlias("sdp",  "ffmpeg");
+        addFileExtensionAlias("m2ts", "ffmpeg");
+        addFileExtensionAlias("ts",   "ffmpeg");
     #endif
 
     // support QuickTime for Windows
