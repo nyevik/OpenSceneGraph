@@ -24,6 +24,69 @@
 
 namespace osgFFmpeg {
 
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+static int convert_audio_frame(AVCodecContext *avctx,
+                               AVFrame *frame,
+                               int16_t *samples,
+                               int *frame_size_ptr,
+                               SwrContext *swr_context,
+                               int out_sample_rate,
+                               int out_nb_channels,
+                               AVSampleFormat out_sample_format)
+{
+    const int frame_channels = frame->ch_layout.nb_channels > 0 ?
+        frame->ch_layout.nb_channels :
+        avctx->ch_layout.nb_channels;
+    const int frame_sample_rate = frame->sample_rate > 0 ?
+        frame->sample_rate :
+        avctx->sample_rate;
+    const int planar = av_sample_fmt_is_planar(static_cast<AVSampleFormat>(frame->format));
+
+    int plane_size = 0;
+    int out_samples = frame->nb_samples;
+
+    if (out_sample_rate != frame_sample_rate)
+        out_samples = av_rescale_rnd(frame->nb_samples, out_sample_rate, frame_sample_rate, AV_ROUND_UP);
+
+    int output_data_size = av_samples_get_buffer_size(&plane_size, out_nb_channels,
+                                                      out_samples, out_sample_format, 1);
+
+    if (*frame_size_ptr < output_data_size)
+    {
+        av_log(avctx, AV_LOG_ERROR, "output buffer size is too small for the current frame (%d < %d)\n",
+               *frame_size_ptr, output_data_size);
+        return AVERROR(EINVAL);
+    }
+
+    if (swr_context != NULL)
+    {
+        out_samples = swr_convert(swr_context, reinterpret_cast<uint8_t **>(&samples), out_samples,
+                                  const_cast<const uint8_t **>(frame->extended_data), frame->nb_samples);
+        if (out_samples < 0)
+            return out_samples;
+
+        output_data_size = av_samples_get_buffer_size(&plane_size, out_nb_channels,
+                                                      out_samples, out_sample_format, 1);
+    }
+    else
+    {
+        memcpy(samples, frame->extended_data[0], plane_size);
+
+        if (planar && frame_channels > 1)
+        {
+            uint8_t *out = reinterpret_cast<uint8_t *>(samples) + plane_size;
+            for (int ch = 1; ch < frame_channels; ++ch)
+            {
+                memcpy(out, frame->extended_data[ch], plane_size);
+                out += plane_size;
+            }
+        }
+    }
+
+    *frame_size_ptr = output_data_size;
+    return 0;
+}
+#else
 static int decode_audio(AVCodecContext *avctx, int16_t *samples,
                          int *frame_size_ptr,
                          const uint8_t *buf, int buf_size,
@@ -114,6 +177,7 @@ static int decode_audio(AVCodecContext *avctx, int16_t *samples,
     return avcodec_decode_audio2(avctx, samples, frame_size_ptr, buf, buf_size);
 #endif
 }
+#endif
 
 
 FFmpegDecoderAudio::FFmpegDecoderAudio(PacketQueue & packets, FFmpegClocks & clocks) :
@@ -127,6 +191,7 @@ FFmpegDecoderAudio::FFmpegDecoderAudio(PacketQueue & packets, FFmpegClocks & clo
     m_audio_buf_size(0),
     m_audio_buf_index(0),
     m_end_of_stream(false),
+    m_owns_context(false),
     m_paused(true),
     m_exit(false),
     m_swr_context(NULL)
@@ -138,6 +203,16 @@ FFmpegDecoderAudio::FFmpegDecoderAudio(PacketQueue & packets, FFmpegClocks & clo
 FFmpegDecoderAudio::~FFmpegDecoderAudio()
 {
     this->close(true);
+    swr_free(&m_swr_context);
+
+    if (m_context)
+    {
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+        if (m_owns_context) avcodec_free_context(&m_context);
+        else
+#endif
+            avcodec_close(m_context);
+    }
 }
 
 
@@ -151,10 +226,25 @@ void FFmpegDecoderAudio::open(AVStream * const stream, FFmpegParameters* paramet
             return;
 
         m_stream = stream;
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+        m_context = avcodec_alloc_context3(NULL);
+        if (!m_context)
+            throw std::runtime_error("avcodec_alloc_context3() failed");
+        m_owns_context = true;
+
+        if (avcodec_parameters_to_context(m_context, stream->codecpar) < 0)
+            throw std::runtime_error("avcodec_parameters_to_context() failed");
+#else
         m_context = stream->codec;
+#endif
 
         m_in_sample_rate = m_context->sample_rate;
-        m_in_nb_channels = m_context->channels;
+        m_in_nb_channels =
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+            m_context->ch_layout.nb_channels;
+#else
+            m_context->channels;
+#endif
         m_in_sample_format = m_context->sample_fmt;
 
         AVDictionaryEntry *opt_out_sample_rate = av_dict_get( *parameters->getOptions(), "out_sample_rate", NULL, 0 );
@@ -189,6 +279,24 @@ printf("### CONVERTING from sample format %s TO %s\n\t\tFROM %d TO %d channels\n
             m_in_sample_rate,
             m_out_sample_rate);
 #endif
+            int err = 0;
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+            AVChannelLayout out_layout;
+            AVChannelLayout in_layout;
+            av_channel_layout_default(&out_layout, m_out_nb_channels);
+            if (m_context->ch_layout.nb_channels > 0)
+                av_channel_layout_copy(&in_layout, &m_context->ch_layout);
+            else
+                av_channel_layout_default(&in_layout, m_in_nb_channels);
+
+            err = swr_alloc_set_opts2(&m_swr_context,
+                                      &out_layout, m_out_sample_format, m_out_sample_rate,
+                                      &in_layout, m_in_sample_format, m_in_sample_rate,
+                                      0, NULL);
+
+            av_channel_layout_uninit(&out_layout);
+            av_channel_layout_uninit(&in_layout);
+#else
             m_swr_context = swr_alloc_set_opts(NULL,
                     av_get_default_channel_layout(m_out_nb_channels),
                     m_out_sample_format,
@@ -197,8 +305,10 @@ printf("### CONVERTING from sample format %s TO %s\n\t\tFROM %d TO %d channels\n
                     m_in_sample_format,
                     m_in_sample_rate,
                     0, NULL );
+#endif
 
-            int err = swr_init(m_swr_context);
+            if (err == 0)
+                err = swr_init(m_swr_context);
 
             if ( err ) {
                 char error_string[512];
@@ -214,7 +324,7 @@ printf("### CONVERTING from sample format %s TO %s\n\t\tFROM %d TO %d channels\n
             throw std::runtime_error("invalid audio codec");;
 
         // Find the decoder for the audio stream
-        AVCodec * const p_codec = avcodec_find_decoder(m_context->codec_id);
+        const AVCodec * const p_codec = avcodec_find_decoder(m_context->codec_id);
 
         if (p_codec == 0)
             throw std::runtime_error("avcodec_find_decoder() failed");
@@ -233,6 +343,9 @@ printf("### CONVERTING from sample format %s TO %s\n\t\tFROM %d TO %d channels\n
 
     catch (...)
     {
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+        if (m_owns_context) avcodec_free_context(&m_context);
+#endif
         m_context = 0;
         throw;
     }
@@ -435,6 +548,83 @@ void FFmpegDecoderAudio::adjustBufferEndPts(const size_t buffer_size)
 
 size_t FFmpegDecoderAudio::decodeFrame(void * const buffer, const size_t size)
 {
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+    for (;;)
+    {
+        AVFrame *frame = av_frame_alloc();
+        if (!frame)
+            return 0;
+
+        const int receive_result = avcodec_receive_frame(m_context, frame);
+        if (receive_result == 0)
+        {
+            int data_size = size;
+            const int convert_result = convert_audio_frame(
+                m_context,
+                frame,
+                reinterpret_cast<int16_t*>(buffer),
+                &data_size,
+                m_swr_context,
+                m_out_sample_rate,
+                m_out_nb_channels,
+                m_out_sample_format);
+            av_frame_free(&frame);
+
+            if (convert_result < 0)
+                continue;
+
+            return data_size;
+        }
+
+        av_frame_free(&frame);
+
+        if (receive_result == AVERROR_EOF && m_end_of_stream)
+        {
+            memset(buffer, 0, size);
+            return size;
+        }
+
+        if (receive_result != AVERROR(EAGAIN) && receive_result != AVERROR_EOF)
+            return 0;
+
+        if (m_packet.valid())
+            m_packet.clear();
+
+        if (m_exit)
+            return 0;
+
+        bool is_empty = true;
+        m_packet = m_packets.tryPop(is_empty);
+
+        if (is_empty)
+            return 0;
+
+        if (m_packet.type == FFmpegPacket::PACKET_DATA)
+        {
+            if (m_packet.packet.pts != int64_t(AV_NOPTS_VALUE))
+            {
+                const double pts = av_q2d(m_stream->time_base) * m_packet.packet.pts;
+                m_clocks.audioSetBufferEndPts(pts);
+            }
+
+            if (avcodec_send_packet(m_context, &m_packet.packet) < 0)
+            {
+                m_packet.clear();
+                continue;
+            }
+        }
+        else if (m_packet.type == FFmpegPacket::PACKET_END_OF_STREAM)
+        {
+            m_end_of_stream = true;
+            avcodec_send_packet(m_context, NULL);
+        }
+        else if (m_packet.type == FFmpegPacket::PACKET_FLUSH)
+        {
+            avcodec_flush_buffers(m_context);
+            m_end_of_stream = false;
+        }
+    }
+#else
     for (;;)
     {
         // Decode current packet
@@ -501,6 +691,7 @@ size_t FFmpegDecoderAudio::decodeFrame(void * const buffer, const size_t size)
             return size;
         }
     }
+#endif
 }
 
 

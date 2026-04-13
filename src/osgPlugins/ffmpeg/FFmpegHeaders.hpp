@@ -10,6 +10,7 @@ extern "C"
 #include <stdint.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
 
 #ifdef USE_AVRESAMPLE    // To compile using libav instead of ffmpeg
 
@@ -60,6 +61,10 @@ extern "C"
 #endif
 
 }
+
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+#define OSG_FFMPEG_USE_NEW_DECODE_API 1
+#endif
 
 
 

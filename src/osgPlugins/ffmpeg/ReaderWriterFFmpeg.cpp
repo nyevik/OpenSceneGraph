@@ -20,9 +20,10 @@
 #include <osgDB/FileUtils>
 
 
-#if LIBAVCODEC_VERSION_MAJOR >= 53 || \
+#if (LIBAVCODEC_VERSION_MAJOR >= 53 || \
     (LIBAVCODEC_VERSION_MAJOR==52 && LIBAVCODEC_VERSION_MINOR>=30) || \
-    (LIBAVCODEC_VERSION_MAJOR==52 && LIBAVCODEC_VERSION_MINOR==20 && LIBAVCODEC_VERSION_MICRO >= 1)
+    (LIBAVCODEC_VERSION_MAJOR==52 && LIBAVCODEC_VERSION_MINOR==20 && LIBAVCODEC_VERSION_MICRO >= 1)) && \
+    !defined(OSG_FFMPEG_USE_NEW_DECODE_API)
     #define USE_AV_LOCK_MANAGER
 #endif
 
@@ -118,7 +119,9 @@ public:
         av_lockmgr_register(&lockMgr);
 #endif
         // Register all FFmpeg formats/codecs
+#if LIBAVFORMAT_VERSION_MAJOR < 58
         av_register_all();
+#endif
 
         avformat_network_init();
     }

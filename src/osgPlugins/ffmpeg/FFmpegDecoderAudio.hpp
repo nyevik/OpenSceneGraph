@@ -80,6 +80,7 @@ private:
     osg::Timer                          m_pause_timer;
 
     bool                                m_end_of_stream;
+    bool                                m_owns_context;
     bool                                m_paused;
     volatile bool                       m_exit;
 

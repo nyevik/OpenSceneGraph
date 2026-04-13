@@ -62,7 +62,7 @@ bool FFmpegDecoder::open(const std::string & filename, FFmpegParameters* paramet
     {
         // Open video file
         AVFormatContext * p_format_context = 0;
-        AVInputFormat *iformat = 0;
+        const AVInputFormat *iformat = 0;
 
         if (filename.compare(0, 5, "/dev/")==0)
         {
@@ -270,6 +270,9 @@ inline void FFmpegDecoder::flushVideoQueue()
 bool FFmpegDecoder::readNextPacketNormal()
 {
     AVPacket packet;
+    av_init_packet(&packet);
+    packet.data = 0;
+    packet.size = 0;
 
     if (! m_pending_packet)
     {
@@ -303,13 +306,8 @@ bool FFmpegDecoder::readNextPacketNormal()
         }
         else
         {
-            // Make the packet data available beyond av_read_frame() logical scope.
-            if ((error = av_dup_packet(&packet)) < 0) {
-                OSG_FATAL << "av_dup_packet() returned " << AvStrError(error) << std::endl;
-                throw std::runtime_error("av_dup_packet() failed");
-            }
-
             m_pending_packet = FFmpegPacket(packet);
+            av_packet_unref(&packet);
         }
     }
 

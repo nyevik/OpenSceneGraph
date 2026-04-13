@@ -24,6 +24,7 @@ FFmpegDecoderVideo::FFmpegDecoderVideo(PacketQueue & packets, FFmpegClocks & clo
     m_writeBuffer(0),
     m_user_data(0),
     m_publish_func(0),
+    m_owns_context(false),
     m_paused(true),
     m_exit(false)
 #ifdef USE_SWSCALE
@@ -51,7 +52,11 @@ FFmpegDecoderVideo::~FFmpegDecoderVideo()
 
     if (m_context)
     {
-        avcodec_close(m_context);
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+        if (m_owns_context) avcodec_free_context(&m_context);
+        else
+#endif
+            avcodec_close(m_context);
     }
 
     OSG_INFO<<"Destructed FFmpegDecoderVideo"<<std::endl;
@@ -62,7 +67,17 @@ FFmpegDecoderVideo::~FFmpegDecoderVideo()
 void FFmpegDecoderVideo::open(AVStream * const stream)
 {
     m_stream = stream;
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+    m_context = avcodec_alloc_context3(NULL);
+    if (!m_context)
+        throw std::runtime_error("avcodec_alloc_context3() failed");
+    m_owns_context = true;
+
+    if (avcodec_parameters_to_context(m_context, stream->codecpar) < 0)
+        throw std::runtime_error("avcodec_parameters_to_context() failed");
+#else
     m_context = stream->codec;
+#endif
 
     // Trust the video size given at this point
     // (avcodec_open seems to sometimes return a 0x0 size)
@@ -99,15 +114,19 @@ void FFmpegDecoderVideo::open(AVStream * const stream)
 
     // Allocate converted RGB frame
     m_frame_rgba.reset(av_frame_alloc());
-    m_buffer_rgba[0].resize(avpicture_get_size(AV_PIX_FMT_RGB24, width(), height()));
+    m_buffer_rgba[0].resize(av_image_get_buffer_size(AV_PIX_FMT_RGB24, width(), height(), 1));
     m_buffer_rgba[1].resize(m_buffer_rgba[0].size());
 
     // Assign appropriate parts of the buffer to image planes in m_frame_rgba
-    avpicture_fill((AVPicture *) (m_frame_rgba).get(), &(m_buffer_rgba[0])[0], AV_PIX_FMT_RGB24, width(), height());
+    if (av_image_fill_arrays(m_frame_rgba->data, m_frame_rgba->linesize, &(m_buffer_rgba[0])[0],
+                             AV_PIX_FMT_RGB24, width(), height(), 1) < 0)
+        throw std::runtime_error("av_image_fill_arrays() failed");
 
     // Override get_buffer()/release_buffer() from codec context in order to retrieve the PTS of each frame.
+#if !defined(OSG_FFMPEG_USE_NEW_DECODE_API)
     m_context->opaque = this;
     m_context->get_buffer2 = getBuffer;
+#endif
 }
 
 
@@ -153,9 +172,53 @@ void FFmpegDecoderVideo::decodeLoop()
 {
     FFmpegPacket packet;
     double pts;
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+    const double frame_interval = m_frame_rate > 0.0 ? (1.0 / m_frame_rate) : 0.040;
+#endif
 
     while (! m_exit)
     {
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+        while (m_paused && !m_exit)
+        {
+            microSleep(10000);
+        }
+
+        if (m_exit)
+            return;
+
+        for (;;)
+        {
+            const int receive_result = avcodec_receive_frame(m_context, m_frame.get());
+
+            if (receive_result == 0)
+            {
+                int64_t frame_pts = AV_NOPTS_VALUE;
+
+                if (m_frame->best_effort_timestamp != int64_t(AV_NOPTS_VALUE))
+                    frame_pts = m_frame->best_effort_timestamp;
+                else if (m_frame->pts != int64_t(AV_NOPTS_VALUE))
+                    frame_pts = m_frame->pts;
+                else if (packet.packet.dts != int64_t(AV_NOPTS_VALUE))
+                    frame_pts = packet.packet.dts;
+
+                pts = frame_pts != int64_t(AV_NOPTS_VALUE) ?
+                    av_q2d(m_stream->time_base) * frame_pts :
+                    0.0;
+
+                const double synched_pts = m_clocks.videoSynchClock(m_frame.get(), frame_interval, pts);
+                const double frame_delay = m_clocks.videoRefreshSchedule(synched_pts);
+
+                publishFrame(frame_delay, m_clocks.audioDisabled());
+                continue;
+            }
+
+            if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF)
+                break;
+
+            throw std::runtime_error("avcodec_receive_frame() failed");
+        }
+#else
         // Work on the current packet until we have decoded all of it
 
         while (m_bytes_remaining > 0)
@@ -237,6 +300,7 @@ void FFmpegDecoderVideo::decodeLoop()
                 publishFrame(frame_delay, m_clocks.audioDisabled());
             }
         }
+#endif
 
         while(m_paused && !m_exit)
         {
@@ -259,11 +323,26 @@ void FFmpegDecoderVideo::decodeLoop()
             {
                 m_bytes_remaining = packet.packet.size;
                 m_packet_data = packet.packet.data;
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+                m_packet_pts = packet.packet.pts;
+
+                const int send_result = avcodec_send_packet(m_context, &packet.packet);
+                if (send_result < 0 && send_result != AVERROR(EAGAIN))
+                    throw std::runtime_error("avcodec_send_packet() failed");
+#endif
             }
             else if (packet.type == FFmpegPacket::PACKET_FLUSH)
             {
                 avcodec_flush_buffers(m_context);
             }
+#if defined(OSG_FFMPEG_USE_NEW_DECODE_API)
+            else if (packet.type == FFmpegPacket::PACKET_END_OF_STREAM)
+            {
+                const int send_result = avcodec_send_packet(m_context, NULL);
+                if (send_result < 0 && send_result != AVERROR_EOF && send_result != AVERROR(EAGAIN))
+                    throw std::runtime_error("avcodec_send_packet(NULL) failed");
+            }
+#endif
         }
     }
 }
@@ -283,7 +362,7 @@ void FFmpegDecoderVideo::findAspectRatio()
     m_pixel_aspect_ratio = ratio;
 }
 
-int FFmpegDecoderVideo::convert(AVPicture *dst, int dst_pix_fmt, AVPicture *src,
+int FFmpegDecoderVideo::convert(AVFrame *dst, int dst_pix_fmt, AVFrame *src,
             int src_pix_fmt, int src_width, int src_height)
 {
     osg::Timer_t startTick = osg::Timer::instance()->tick();
@@ -298,15 +377,18 @@ int FFmpegDecoderVideo::convert(AVPicture *dst, int dst_pix_fmt, AVPicture *src,
 
     OSG_DEBUG<<"Using sws_scale ";
 
+    const uint8_t * const *src_data = const_cast<const uint8_t * const *>(src->data);
     int result =  sws_scale(m_swscale_ctx,
-                            (src->data), (src->linesize), 0, src_height,
-                            (dst->data), (dst->linesize));
+                            src_data, src->linesize, 0, src_height,
+                            dst->data, dst->linesize);
 #else
 
-    OSG_DEBUG<<"Using img_convert ";
+    OSG_DEBUG<<"Using av_image_copy ";
 
-    int result = img_convert(dst, dst_pix_fmt, src,
-                             src_pix_fmt, src_width, src_height);
+    av_image_copy(dst->data, dst->linesize,
+                  const_cast<const uint8_t * const *>(src->data), src->linesize,
+                  static_cast<AVPixelFormat>(src_pix_fmt), src_width, src_height);
+    int result = 0;
 
 #endif
     osg::Timer_t endTick = osg::Timer::instance()->tick();
@@ -334,11 +416,14 @@ void FFmpegDecoderVideo::publishFrame(const double delay, bool audio_disabled)
         return;
 #endif
 
-    AVPicture * const src = (AVPicture *) m_frame.get();
-    AVPicture * const dst = (AVPicture *) m_frame_rgba.get();
+    AVFrame * const src = m_frame.get();
+    AVFrame * const dst = m_frame_rgba.get();
 
     // Assign appropriate parts of the buffer to image planes in m_frame_rgba
-    avpicture_fill((AVPicture *) (m_frame_rgba).get(), &(m_buffer_rgba[m_writeBuffer])[0], AV_PIX_FMT_RGB24, width(), height());
+    if (av_image_fill_arrays(m_frame_rgba->data, m_frame_rgba->linesize,
+                             &(m_buffer_rgba[m_writeBuffer])[0], AV_PIX_FMT_RGB24,
+                             width(), height(), 1) < 0)
+        throw std::runtime_error("av_image_fill_arrays() failed");
 
     // Convert YUVA420p (i.e. YUV420p plus alpha channel) using our own routine
 
@@ -370,7 +455,7 @@ void FFmpegDecoderVideo::publishFrame(const double delay, bool audio_disabled)
 
 
 
-void FFmpegDecoderVideo::yuva420pToRgba(AVPicture * const dst, AVPicture * const src, int width, int height)
+void FFmpegDecoderVideo::yuva420pToRgba(AVFrame * const dst, AVFrame * const src, int width, int height)
 {
     convert(dst, AV_PIX_FMT_RGB24, src, m_context->pix_fmt, width, height);
 

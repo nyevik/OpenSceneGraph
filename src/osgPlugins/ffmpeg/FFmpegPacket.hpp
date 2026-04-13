@@ -23,33 +23,66 @@ namespace osgFFmpeg
         FFmpegPacket() :
             type(PACKET_DATA)
         {
+            av_init_packet(&packet);
             packet.data = 0;
+            packet.size = 0;
         }
 
         explicit FFmpegPacket(const Type t) :
             type(t)
         {
+            av_init_packet(&packet);
             packet.data = 0;
+            packet.size = 0;
         }
 
         explicit FFmpegPacket(const AVPacket & p) :
-            packet(p),
             type(PACKET_DATA)
         {
+            av_init_packet(&packet);
+            packet.data = 0;
+            packet.size = 0;
+            av_packet_ref(&packet, &p);
+        }
 
+        FFmpegPacket(const FFmpegPacket& rhs) :
+            type(rhs.type)
+        {
+            av_init_packet(&packet);
+            packet.data = 0;
+            packet.size = 0;
+
+            if (rhs.packet.data != 0 || rhs.packet.size != 0)
+                av_packet_ref(&packet, &rhs.packet);
+        }
+
+        FFmpegPacket& operator=(const FFmpegPacket& rhs)
+        {
+            if (this == &rhs) return *this;
+
+            clear();
+            type = rhs.type;
+
+            if (rhs.packet.data != 0 || rhs.packet.size != 0)
+                av_packet_ref(&packet, &rhs.packet);
+
+            return *this;
+        }
+
+        ~FFmpegPacket()
+        {
+            clear();
         }
 
         void clear()
         {
-            if (packet.data != 0)
-                av_free_packet(&packet);
-
-            release();
+            av_packet_unref(&packet);
+            type = PACKET_DATA;
         }
 
         void release()
         {
-            packet.data = 0;
+            av_packet_unref(&packet);
             type = PACKET_DATA;
         }
 
