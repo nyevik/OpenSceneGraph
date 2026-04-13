@@ -104,3 +104,6 @@ _CPack_Packages/
 #individual build files
 config.yaml
 _build
+
+#out-of-source in-build directories
+build/
